@@ -14,7 +14,7 @@ from functools import partial
 from tqdm import tqdm
 
 
-# %%Class
+# %%Class structures to organize and pass data
 class ClassifierFramewise():
     def __init__(self, groupinfo=None):
         if groupinfo is not None:
@@ -42,7 +42,7 @@ class GroupInfo():
         self.center = int(self.nSteps/2)
 
 
-# %%Optimized controls
+# %%Optimized controls, parallel processed
 def classifierChanceLevel(func, seqCentered, nPermsControl=101, nPermsSubsample=100, groupSize=None, num_cpus=20):
     """
     Parameters
@@ -61,7 +61,6 @@ def classifierChanceLevel(func, seqCentered, nPermsControl=101, nPermsSubsample=
     -------
     SVM_control : TYPE
         DESCRIPTION.
-
     """
 
     subsample_idx = [seqCentered.set_matched_groups().matchedGroupIdxs for i in range(nPermsSubsample)]
@@ -93,17 +92,19 @@ def get_decomposed_data(seqCentered, nPermsSubsample, idxs_, num_cpus=5):
     results = list(tqdm(pool.imap_unordered(func, data)))
     pool.close()
 
-    decomp = np.vstack(results)
+    dims = results[0].shape
+    decomp = np.concatenate([r.reshape((1, *dims)) for r in results], 0)
+
     return decomp
 
 
-def controlMatchedGroupSubsampling(clffunc, decomp, groupLabels, nPerms, ncpus=5):
+def controlMatchedGroupSubsampling(clffunc, decomp, groupLabels, nPerms, num_cpus=5):
     groupinfo = GroupInfo(groupLabels, decomp.shape[2])
     classifier = ClassifierFramewise()
 
-    pool = Pool(ncpus)
+    pool = Pool(num_cpus)
     parfunc = partial(clffunc,
-                    groupinfo)
+                    groupinfo=groupinfo)
     results = list(tqdm(pool.imap_unordered(parfunc, [decomp[i,:,:,:] for i in range(len(decomp))])))
     pool.close()
 
@@ -112,11 +113,7 @@ def controlMatchedGroupSubsampling(clffunc, decomp, groupLabels, nPerms, ncpus=5
     return classifier
 
 
-def gperm(groupinfo):
-    return GroupInfo(np.random.permutation(groupinfo.groupLabels), groupinfo.nSteps)
-
-
-# %%helper functions
+# %%Base functions
 def get_svm_simple(decomp, groupinfo):
     '''
     decomp = nSeqs x nSteps x nPCs
@@ -140,8 +137,36 @@ def get_svm_simple(decomp, groupinfo):
 
 def get_pca_decomp(seqCentered, n_components=8, frames='sep',
                    debug=False):
+    """
+    Parameters
+    ----------
+    seqCentered : class with
+        attributes: groupLabels (array), nSteps (integer), matchedGroupIdxs (array)
+            data (array, [nSequences, nSteps, nPixels])
+        methods: set_matched_groups() 
+    n_components : int, optional
+        DESCRIPTION. Number of principal components for pca decomposition in the preprocessing.
+        The default is 8.
+    frames : string, optional
+        Determines what data the PCA is run on.
+        'center': PCA components computed from center frames only.
+        'all': PCA components computed from all frames
+        'sep': PCA components computed per frame, that is, there are multiple PCA decompositions
+            equal to the number of frames in the data. This is the method for 
+            LK's Journal of Neuroscience paper, Figure 5.
+        
+        DESCRIPTION. The default is 'sep'.
+        
+    debug : TYPE, optional
+        DESCRIPTION. The default is False.
 
-    if not debug: #this odd construction is so that the main function is on top
+    Returns
+    -------
+    decomp
+        array (nSeqs ,nSteps, nPCAs)
+    """
+
+    if not debug: #main function
         if frames=='center':
             pca_frames = seqCentered.data[:,seqCentered.centerFrame,:]
             pca = PCA(n_components=n_components, whiten=False, svd_solver='randomized')
@@ -170,9 +195,7 @@ def get_pca_decomp(seqCentered, n_components=8, frames='sep',
         pca_full = PCA()
         pca_center = PCA()
         model_all = pca_full.fit(seqCentered.get_framestacked())
-        center_frames = seqCentered.data[:,:,seqCentered.centerFrame]
         model_center = pca_center.fit(seqCentered.centerFrame)
-
 
         all_ve_100 = []
         center_ve_100 = []
@@ -182,12 +205,10 @@ def get_pca_decomp(seqCentered, n_components=8, frames='sep',
             center_ve_100.append(np.cumsum(pca_center.explained_variance_(model_center, current_frames)[0:20]))
             print(step)
 
-
         fig, ax = plt.subplots(1,seqCentered.nSteps, sharey=True, sharex=True)
         for step in range(seqCentered.nSteps):
             ax[step].plot(all_ve_100[step], label='all')
             ax[step].plot(center_ve_100[step], label='center')
-
 
         ax[-1].legend()
         ax[0].set_ylabel('var expl ratio')
