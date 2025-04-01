@@ -6,16 +6,13 @@ Created on Thu Feb 15 17:05:38 2024
 @author: ckettlew
 """
 import numpy as np
-
 from sklearn.decomposition import PCA
 from sklearn import svm
 from sklearn.model_selection import StratifiedKFold as KFold
+from multiprocessing import Pool
+from functools import partial
+from tqdm import tqdm
 
-from kettlewell.propagation.GreedyGroupsClass import GroupInfo
-
-# TODO! 
-#   transform all the dumb rays into multiprocessing pools
-#   get rid of GroupInfo
 
 # %%Class
 class ClassifierFramewise():
@@ -37,8 +34,16 @@ class ClassifierFramewise():
         return self.sig
 
 
+class GroupInfo():
+    def __init__(self,group_labels, nSteps):
+        self.groupLabels = group_labels
+        self.nGroups = len(np.unique(group_labels))
+        self.nSteps = nSteps
+        self.center = int(self.nSteps/2)
+
+
 # %%Optimized controls
-def classifierChanceLevel(func, seqCentered, nPermsControl=101, nPermsSubsample=100, groupSize=None, ncpus=20):
+def classifierChanceLevel(func, seqCentered, nPermsControl=101, nPermsSubsample=100, groupSize=None, num_cpus=20):
     """
     Parameters
     ----------
@@ -59,99 +64,56 @@ def classifierChanceLevel(func, seqCentered, nPermsControl=101, nPermsSubsample=
 
     """
 
-    subsample_idx = [seqCentered.set_matched_groups().matchedGroupIdxs for i in range(100)]
-    decomp = get_decomposed_data_ray(seqCentered, nPermsSubsample, subsample_idx)
+    subsample_idx = [seqCentered.set_matched_groups().matchedGroupIdxs for i in range(nPermsSubsample)]
+    decomp = get_decomposed_data(seqCentered, nPermsSubsample, subsample_idx, num_cpus=num_cpus)
+    print('pca decomp done')
 
-    groupLabels = seqCentered.groupLabels
-    classifier_data = controlMatchedGroupSubsampling(func, decomp, groupLabels,
-                                                nPerms=nPermsSubsample, ncpus=ncpus)
+    classifier_data = controlMatchedGroupSubsampling(func, decomp, seqCentered.groupLabels,
+                                                nPerms=nPermsSubsample, num_cpus=num_cpus)
     classifier_scores = classifier_data.scores
+    print('data classifier done. starting control...')
 
     control_scores = np.zeros((nPermsControl, nPermsSubsample, seqCentered.nSteps))
     for i in range(nPermsControl):
         groupLabels = np.random.permutation(seqCentered.groupLabels)
         classifier = controlMatchedGroupSubsampling(func, decomp, groupLabels,
-                                                    nPerms=nPermsSubsample, ncpus=ncpus)
+                                                    nPerms=nPermsSubsample, num_cpus=num_cpus)
         control_scores[i,:,:] = classifier.scores
-        # p = np.mean(control_scores[i,:,:]<classifier_scores[:,:]
         print(i+1)
-        # print(f'percentile of classifier: {p*100:.2f}')
-
 
     return classifier_scores, control_scores, subsample_idx
 
 
-def controlMatchedGroupSubsampling(func, decomp, groupLabels, nPerms, ncpus=20):
-    groupinfo = GroupInfo(groupLabels, decomp.shape[2])
-    classifier = ClassifierFramewise()
+def get_decomposed_data(seqCentered, nPermsSubsample, idxs_, num_cpus=5):
+    pool = Pool(num_cpus)
+    func = partial(get_pca_decomp,
+                    n_components=8,
+                    frames='sep')
+    data = [seqCentered.set_matched_groups(idxs_[i]) for i in range(nPermsSubsample)]
+    results = list(tqdm(pool.imap_unordered(func, data)))
+    pool.close()
 
-    ray.shutdown()
-    ray.init(num_cpus=ncpus)
-    control_scores = [
-        ray_shuffle.remote(
-        [func,
-         decomp[i,:,:,:],
-         groupinfo]
-        )
-        for i in range(nPerms)]
-    classifier.scores = np.stack(ray.get(control_scores))
-    ray.shutdown()
-
-    return classifier
-
-
-def classifierMatchedGroupSubsampling(func, seqCentered, nPerms=100, groupSize=None, ncpus=20):
-    #randIdx turns this into a control run
-    groupinfo = GroupInfo(seqCentered.groupLabels, seqCentered.nSteps)
-    classifier = ClassifierFramewise()
-
-
-    ray.shutdown()
-    ray.init(num_cpus=ncpus)
-    scores = [
-        ray_shuffle.remote(
-        [func,
-         get_pca_decomp(seqCentered.set_matched_groups(groupSize=groupSize)),
-         groupinfo]
-        )
-        for i in range(nPerms)]
-    #get_svm_simple(decomp, groupinfo)
-    classifier.scores = np.stack(ray.get(scores))
-    ray.shutdown()
-
-    return classifier
-
-
-# %%Helper functions
-def get_decomposed_data_ray(seqCentered, nPermsSubsample, idxs, num_cpus=5):
-    ray.shutdown()
-    n = int(np.ceil(nPermsSubsample/num_cpus))
-    decomp_agg = []
-    for n_ in range(n):
-        idxs_ = [idxs[i] for i in range(n_*num_cpus, (n_+1)*num_cpus)]
-        ray.init(num_cpus=num_cpus)
-        decomp = [raycompose.remote(seqCentered.set_matched_groups(idxs_[i])) for i in range(num_cpus)]
-        decomp_agg.append(np.stack(ray.get(decomp)))
-        ray.shutdown()
-        print(f'{(n_+1)*num_cpus/nPermsSubsample*100:.2f}% pca done')
-    print('stacking decomps')
-    decomp = np.vstack(decomp_agg)
+    decomp = np.vstack(results)
     return decomp
 
 
-@ray.remote
-def ray_shuffle(args):
-    '''
-    args = [func, groupinfo, decomp]
-    func must have a 'scores' attribute
-    '''
-    func = args.pop(0)
-    return func(*args).scores
+def controlMatchedGroupSubsampling(clffunc, decomp, groupLabels, nPerms, ncpus=5):
+    groupinfo = GroupInfo(groupLabels, decomp.shape[2])
+    classifier = ClassifierFramewise()
+
+    pool = Pool(ncpus)
+    parfunc = partial(clffunc,
+                    groupinfo)
+    results = list(tqdm(pool.imap_unordered(parfunc, [decomp[i,:,:,:] for i in range(len(decomp))])))
+    pool.close()
+
+    classifier.scores = np.stack([r.scores for r in results])
+
+    return classifier
 
 
-@ray.remote
-def raycompose(seqCentered):
-    return get_pca_decomp(seqCentered, n_components=8, frames='sep')
+def gperm(groupinfo):
+    return GroupInfo(np.random.permutation(groupinfo.groupLabels), groupinfo.nSteps)
 
 
 # %%helper functions
